@@ -11,6 +11,7 @@ from baselines.common.policies import build_policy
 from baselines.common.runners import AbstractEnvRunner
 from baselines.common.tf_util import get_session, save_variables, load_variables
 from baselines.common.mpi_adam_optimizer import MpiAdamOptimizer
+from baselines.common.ICM import ICM
 
 from mpi4py import MPI
 from baselines.common.tf_util import initialize
@@ -31,6 +32,8 @@ class Model(object):
     """
     def __init__(self, *, policy, ob_space, ac_space, nbatch_act, nbatch_train,
                 nsteps, ent_coef, vf_coef, max_grad_norm):
+
+
         sess = get_session()
 
         with tf.variable_scope('ppo2_model', reuse=tf.AUTO_REUSE):
@@ -40,6 +43,10 @@ class Model(object):
 
             # Train model for training
             train_model = policy(nbatch_train, nsteps, sess)
+
+        # TODO: remove
+        # If we want to use intrinsic rewards (curiosity), we instantiate the ICM module
+        #
 
         # CREATE THE PLACEHOLDERS
         A = train_model.pdtype.sample_placeholder([None])
@@ -59,7 +66,7 @@ class Model(object):
         # Entropy is used to improve exploration by limiting the premature convergence to suboptimal policy.
         entropy = tf.reduce_mean(train_model.pd.entropy())
 
-        # CALCULATE THE LOSS
+        # CALCULATE THE LOSS FOR PPO
         # Total loss = Policy gradient loss - entropy * entropy coefficient + Value coefficient * value loss
 
         # Clip the value to reduce variability during Critic training
@@ -107,6 +114,9 @@ class Model(object):
 
         _train = trainer.apply_gradients(grads_and_var)
 
+        
+
+
         def train(lr, cliprange, obs, returns, masks, actions, values, neglogpacs, states=None):
             # Here we calculate advantage A(s,a) = R + yV(s') - V(s)
             # Returns = R + yV(s')
@@ -139,6 +149,7 @@ class Model(object):
         if MPI.COMM_WORLD.Get_rank() == 0:
             initialize()
         global_variables = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope="")
+        print("GLOBAL VARIABLES", global_variables)
         sync_from_root(sess, global_variables) #pylint: disable=E1101
 
 class Runner(AbstractEnvRunner):
@@ -150,14 +161,20 @@ class Runner(AbstractEnvRunner):
     run():
     - Make a mini batch
     """
-    def __init__(self, *, env, model, nsteps, gamma, lam):
-        super().__init__(env=env, model=model, nsteps=nsteps)
-        # Lambda used in GAE (General Advantage Estimation)
+    def __init__(self, *, env, model, icm, nsteps, gamma, lam):
+        super().__init__(env=env, model=model, icm=icm, nsteps=nsteps)
+        # Lambda used in GAE (General Advantage Estimation) 
         self.lam = lam
         # Discount rate
         self.gamma = gamma
-
+        # icm model
+        self.icm = icm
+    
     def run(self):
+
+        # TODO remove
+        curiosity = True
+
         # Here, we init the lists that will contain the mb of experiences
         mb_obs, mb_rewards, mb_actions, mb_values, mb_dones, mb_neglogpacs = [],[],[],[],[],[]
         mb_states = self.states
@@ -167,11 +184,15 @@ class Runner(AbstractEnvRunner):
             # Given observations, get action value and neglopacs
             # We already have self.obs because Runner superclass run self.obs[:] = env.reset() on init
             actions, values, self.states, neglogpacs = self.model.step(self.obs, S=self.states, M=self.dones)
+            
             mb_obs.append(self.obs.copy())
             mb_actions.append(actions)
             mb_values.append(values)
             mb_neglogpacs.append(neglogpacs)
             mb_dones.append(self.dones)
+
+            if curiosity:
+                states = self.obs[:]
 
             # Take actions in env and look the results
             # Infos contains a ton of useful informations
@@ -179,6 +200,18 @@ class Runner(AbstractEnvRunner):
             for info in infos:
                 maybeepinfo = info.get('episode')
                 if maybeepinfo: epinfos.append(maybeepinfo)
+
+            if curiosity:
+                next_states = self.obs[:]
+                rewards = 0.0
+                # state, next_state, action
+                
+                rewards = self.icm.calculate_intrinsic_reward(states, next_states, actions)
+                print("INTRISINCIS REWARDS", rewards)
+
+                # Train the icm module
+                #loss = icm.train()
+
             mb_rewards.append(rewards)
         #batch of steps to batch of rollouts
         mb_obs = np.asarray(mb_obs, dtype=self.obs.dtype)
@@ -189,20 +222,34 @@ class Runner(AbstractEnvRunner):
         mb_dones = np.asarray(mb_dones, dtype=np.bool)
         last_values = self.model.value(self.obs, S=self.states, M=self.dones)
 
-        # discount/bootstrap off value fn
-        mb_returns = np.zeros_like(mb_rewards)
-        mb_advs = np.zeros_like(mb_rewards)
-        lastgaelam = 0
-        for t in reversed(range(self.nsteps)):
-            if t == self.nsteps - 1:
-                nextnonterminal = 1.0 - self.dones
-                nextvalues = last_values
-            else:
-                nextnonterminal = 1.0 - mb_dones[t+1]
-                nextvalues = mb_values[t+1]
-            delta = mb_rewards[t] + self.gamma * nextvalues * nextnonterminal - mb_values[t]
-            mb_advs[t] = lastgaelam = delta + self.gamma * self.lam * nextnonterminal * lastgaelam
-        mb_returns = mb_advs + mb_values
+        # If curiosity, we don't care about death end
+        if curiosity:
+            # discount/bootstrap off value fn
+            mb_returns = np.zeros_like(mb_rewards)
+            mb_advs = np.zeros_like(mb_rewards)
+            lastgaelam = 0
+            for t in reversed(range(self.nsteps)):
+                delta = mb_rewards[t] + self.gamma * nextvalues - mb_values[t]
+                mb_advs[t] = lastgaelam = delta + self.gamma * self.lam * lastgaelam
+            mb_returns = mb_advs + mb_values
+
+
+        if curiosity == False:
+            # discount/bootstrap off value fn
+            mb_returns = np.zeros_like(mb_rewards)
+            mb_advs = np.zeros_like(mb_rewards)
+            lastgaelam = 0
+            for t in reversed(range(self.nsteps)):
+                if t == self.nsteps - 1:
+                    nextnonterminal = 1.0 - self.dones
+                    nextvalues = last_values
+                else:
+                    nextnonterminal = 1.0 - mb_dones[t+1]
+                    nextvalues = mb_values[t+1]
+                delta = mb_rewards[t] + self.gamma * nextvalues * nextnonterminal - mb_values[t]
+                mb_advs[t] = lastgaelam = delta + self.gamma * self.lam * nextnonterminal * lastgaelam
+            mb_returns = mb_advs + mb_values
+        
         return (*map(sf01, (mb_obs, mb_returns, mb_dones, mb_actions, mb_values, mb_neglogpacs)),
             mb_states, epinfos)
 # obs, returns, masks, actions, values, neglogpacs, states = runner.run()
@@ -277,6 +324,9 @@ def learn(*, network, env, total_timesteps, eval_env = None, seed=None, nsteps=2
 
     '''
 
+    #TODO remove
+    curiosity = True
+
     set_global_seeds(seed)
 
     if isinstance(lr, float): lr = constfn(lr)
@@ -289,6 +339,8 @@ def learn(*, network, env, total_timesteps, eval_env = None, seed=None, nsteps=2
 
     # Get the nb of env
     nenvs = env.num_envs
+
+    print("NUM ENVIRONMENTS", nenvs)
 
     # Get state_space and action_space
     ob_space = env.observation_space
@@ -305,11 +357,24 @@ def learn(*, network, env, total_timesteps, eval_env = None, seed=None, nsteps=2
     model = make_model()
     if load_path is not None:
         model.load(load_path)
+
+
+    # Instantiate the icm object
+    if curiosity:
+        # Instantiate the ICM model
+        make_icm = lambda: ICM(ob_space = ob_space, ac_space = ac_space, max_grad_norm = max_grad_norm, beta = 0.2, icm_lr_scale = 0.5 )
+        icm = make_icm()
+
+
     # Instantiate the runner object
-    runner = Runner(env=env, model=model, nsteps=nsteps, gamma=gamma, lam=lam)
+    if curiosity == False:
+        runner = Runner(env=env, model=model,  nsteps=nsteps, gamma=gamma, lam=lam)
+    else:
+        runner = Runner(env=env, model=model, icm=icm,  nsteps=nsteps, gamma=gamma, lam=lam)
+
+
     if eval_env is not None:
         eval_runner = Runner(env = eval_env, model = model, nsteps = nsteps, gamma = gamma, lam= lam)
-
 
 
     epinfobuf = deque(maxlen=100)
@@ -401,6 +466,7 @@ def learn(*, network, env, total_timesteps, eval_env = None, seed=None, nsteps=2
             print('Saving to', savepath)
             model.save(savepath)
     return model
+
 # Avoid division error when calculate the mean (in our case if epinfo is empty returns np.nan, not return an error)
 def safemean(xs):
     return np.nan if len(xs) == 0 else np.mean(xs)
